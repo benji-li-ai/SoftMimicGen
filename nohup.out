@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/benjamin.li/src/SoftMimicGen/scripts/imitation_learning/openpi/serve_checkpoint.py", line 97, in <module>
+    main()
+  File "/home/benjamin.li/src/SoftMimicGen/scripts/imitation_learning/openpi/serve_checkpoint.py", line 67, in main
+    raise FileNotFoundError(
+FileNotFoundError: /tmp/smg_eval_ckpt/19999/params is missing. Serving needs both params/ and assets/ (the latter carries norm_stats.json); see fetch_checkpoint.sh.

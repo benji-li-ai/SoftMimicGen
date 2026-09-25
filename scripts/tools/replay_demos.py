@@ -23,6 +23,15 @@ parser.add_argument(
     help="A list of episode indices to be replayed. Keep empty to replay all in the dataset file.",
 )
 parser.add_argument("--dataset_file", type=str, default="datasets/dataset.hdf5", help="Dataset file to be replayed.")
+parser.add_argument("--video_file", type=str, default=None, help="Optional MP4 output path for the replay.")
+parser.add_argument(
+    "--video_cameras",
+    type=str,
+    nargs="+",
+    default=["top_camera", "left_wrist_camera", "right_wrist_camera"],
+    help="Scene camera names to tile in the replay MP4.",
+)
+parser.add_argument("--video_fps", type=int, default=30, help="Frame rate of the output MP4.")
 parser.add_argument(
     "--validate_states",
     action="store_true",
@@ -43,6 +52,8 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+if args_cli.video_file is not None:
+    args_cli.enable_cameras = True
 # args_cli.headless = True
 
 if args_cli.enable_pinocchio:
@@ -57,8 +68,10 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import contextlib
+import cv2
 import gymnasium as gym
 import os
+import numpy as np
 import torch
 
 from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg
@@ -112,6 +125,31 @@ def compare_states(state_from_dataset, runtime_state, runtime_env_index) -> (boo
                         output_log += f"\t  Dataset:\t{dataset_asset_state[i]}\r\n"
                         output_log += f"\t  Runtime: \t{runtime_asset_state[i]}\r\n"
     return states_matched, output_log
+
+def compose_video_frame(env, camera_names: list[str]) -> np.ndarray:
+    """Tile current RGB scene-camera outputs and return a BGR uint8 video frame."""
+    frames = []
+    for camera_name in camera_names:
+        camera = env.scene[camera_name]
+        camera.update(dt=0.0, force_recompute=True)
+        frame = camera.data.output["rgb"][0, ..., :3].detach().cpu().numpy()
+        if frame.dtype != np.uint8:
+            frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+        frames.append((camera_name, frame))
+
+    height = max(frame.shape[0] for _, frame in frames)
+    tiled_frames = []
+    labels = {"top_camera": "top", "left_wrist_camera": "left", "right_wrist_camera": "right"}
+    for camera_name, frame in frames:
+        if frame.shape[0] != height:
+            frame = cv2.resize(frame, (round(frame.shape[1] * height / frame.shape[0]), height))
+        for color, thickness in (((0, 0, 0), 3), ((255, 255, 255), 1)):
+            cv2.putText(
+                frame, labels.get(camera_name, camera_name), (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, thickness,
+                cv2.LINE_AA,
+            )
+        tiled_frames.append(frame)
+    return cv2.cvtColor(np.ascontiguousarray(np.concatenate(tiled_frames, axis=1)), cv2.COLOR_RGB2BGR)
 
 
 def main():
@@ -175,6 +213,7 @@ def main():
     # simulate environment -- run everything in inference mode
     episode_names = list(dataset_file_handler.get_episode_names())
     replayed_episode_count = 0
+    video_writer = None
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         while simulation_app.is_running() and not simulation_app.is_exiting():
             env_episode_data_map = {index: EpisodeData() for index in range(num_envs)}
@@ -219,6 +258,20 @@ def main():
                         env.sim.render()
                         continue
                 env.step(actions)
+                if args_cli.video_file is not None:
+                    frame = compose_video_frame(env, args_cli.video_cameras)
+                    if video_writer is None:
+                        output_dir = os.path.dirname(os.path.abspath(args_cli.video_file))
+                        os.makedirs(output_dir, exist_ok=True)
+                        video_writer = cv2.VideoWriter(
+                            args_cli.video_file,
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            args_cli.video_fps,
+                            (frame.shape[1], frame.shape[0]),
+                        )
+                        if not video_writer.isOpened():
+                            raise RuntimeError(f"Failed to open video output: {args_cli.video_file}")
+                    video_writer.write(frame)
 
                 if state_validation_enabled:
                     state_from_dataset = env_episode_data_map[0].get_next_state()
@@ -235,6 +288,9 @@ def main():
                             print("\t- mismatched.")
                             print(comparison_log)
             break
+    if video_writer is not None:
+        video_writer.release()
+        print(f"Wrote replay video to {os.path.abspath(args_cli.video_file)}")
     # Close environment after replay in complete
     plural_trailing_s = "s" if replayed_episode_count > 1 else ""
     print(f"Finished replaying {replayed_episode_count} episode{plural_trailing_s}.")

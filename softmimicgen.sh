@@ -46,6 +46,7 @@ fi
 # Step 5: Install Isaac Lab
 echo "[SoftMimicGen] Installing Isaac Lab..."
 export ACCEPT_EULA=yes
+export OMNI_KIT_ACCEPT_EULA=YES
 cd ${ISAACLAB_DIR}
 ./isaaclab.sh -i
 cd ../..

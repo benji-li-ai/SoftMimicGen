@@ -12,28 +12,29 @@ import gymnasium as gym
 
 from .franka_cube_ik_rel_mimic_env import FrankaCubeMimicEnv
 from .franka_cube_ik_rel_mimic_env_cfg import FrankaCubeMimicEnvCfg
-
 from .franka_jenga_ik_rel_mimic_env import FrankaJengaMimicEnv
 from .franka_jenga_ik_rel_mimic_env_cfg import FrankaJengaMimicEnvCfg
-
 from .franka_rope_ik_rel_mimic_env import FrankaRopeMimicEnv
 from .franka_rope_ik_rel_mimic_env_cfg import FrankaRopeMimicEnvCfg
-
 from .franka_towel_ik_rel_mimic_env import FrankaTowelMimicEnv
 from .franka_towel_ik_rel_mimic_env_cfg import FrankaTowelMimicEnvCfg
-
 from .surgical_threading_ik_rel_mimic_env import SurgicalThreadingMimicEnv
 from .surgical_threading_ik_rel_mimic_env_cfg import SurgicalThreadingMimicEnvCfg
-
 from .surgical_tissue_ik_rel_mimic_env import SurgicalTissueMimicEnv
 from .surgical_tissue_ik_rel_mimic_env_cfg import SurgicalTissueMimicEnvCfg
-
 from .yam_bag_joint_mimic_env import YamBagMimicEnv
 from .yam_bag_joint_mimic_env_cfg import YamBagMimicEnvCfg
-
+from .yam_cell_towel_joint_dr_mimic_env_cfg import YamCellTowelDRMimicEnvCfg
+from .yam_cell_towel_joint_mimic_env_cfg import YamCellTowelMimicEnvCfg
+from .yam_cell_towel_joint_perception_mimic_env_cfg import YamCellTowelPerceptionMimicEnvCfg
+from .yam_red_cloth_joint_dr_mimic_env_cfg import YamRedClothDRMimicEnvCfg
+from .yam_red_cloth_joint_mimic_env import YamRedClothMimicEnv
+from .yam_red_cloth_joint_mimic_env_cfg import YamRedClothMimicEnvCfg
+from .yam_red_cloth_joint_perception_mimic_env_cfg import YamRedClothPerceptionMimicEnvCfg
+from .yam_towel_joint_dr_mimic_env_cfg import YamTowelDRMimicEnvCfg
 from .yam_towel_joint_mimic_env import YamTowelMimicEnv
 from .yam_towel_joint_mimic_env_cfg import YamTowelMimicEnvCfg
-
+from .yam_towel_joint_perception_mimic_env_cfg import YamTowelPerceptionMimicEnvCfg
 
 gym.register(
     id="Isaac-Stack-Soft-Cube-Franka-IK-Rel-Mimic-v0",
@@ -103,6 +104,78 @@ gym.register(
     entry_point="softmimicgen.envs:YamTowelMimicEnv",
     kwargs={
         "env_cfg_entry_point": yam_towel_joint_mimic_env_cfg.YamTowelMimicEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Fold-Towel-Yam-Joint-DR-Mimic-v0",
+    entry_point="softmimicgen.envs:YamTowelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": yam_towel_joint_dr_mimic_env_cfg.YamTowelDRMimicEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Fold-Towel-Yam-Joint-Perception-Mimic-v0",
+    entry_point="softmimicgen.envs:YamTowelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": yam_towel_joint_perception_mimic_env_cfg.YamTowelPerceptionMimicEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Fold-Red-Cloth-Yam-Joint-Mimic-v0",
+    entry_point="softmimicgen.envs:YamRedClothMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": yam_red_cloth_joint_mimic_env_cfg.YamRedClothMimicEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Fold-Red-Cloth-Yam-Joint-DR-Mimic-v0",
+    entry_point="softmimicgen.envs:YamRedClothMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": yam_red_cloth_joint_dr_mimic_env_cfg.YamRedClothDRMimicEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Fold-Red-Cloth-Yam-Joint-Perception-Mimic-v0",
+    entry_point="softmimicgen.envs:YamRedClothMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": yam_red_cloth_joint_perception_mimic_env_cfg.YamRedClothPerceptionMimicEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Fold-Cell-Towel-Yam-Joint-Mimic-v0",
+    entry_point="softmimicgen.envs:YamTowelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": yam_cell_towel_joint_mimic_env_cfg.YamCellTowelMimicEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Fold-Cell-Towel-Yam-Joint-DR-Mimic-v0",
+    entry_point="softmimicgen.envs:YamTowelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": yam_cell_towel_joint_dr_mimic_env_cfg.YamCellTowelDRMimicEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Fold-Cell-Towel-Yam-Joint-Perception-Mimic-v0",
+    entry_point="softmimicgen.envs:YamTowelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": yam_cell_towel_joint_perception_mimic_env_cfg.YamCellTowelPerceptionMimicEnvCfg,
     },
     disable_env_checker=True,
 )

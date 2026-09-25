@@ -27,16 +27,35 @@ from softmimicgen_assets.robots.yam import YAM_CONFIG_HIGH_PD_CFG  # isort: skip
 
 @configclass
 class YamTowelEnvCfg(EnvCfg):
+
+    mount_height_offset: float = 0.02
+    """Vertical correction applied to both arm mounts, in metres.
+
+    Measured at roughly 2 cm on the target cell: the real arms sit above the tabletop rather than
+    flush with it as the shipped workstation asset has them.
+
+    The shipped workstation asset mounts both arms flush with the tabletop at z = 0.755. On real
+    YAM cells the arms sit higher, and that mismatch is a sim-to-real gap best closed by measuring
+    the real offset and setting it here -- not by randomizing around a value known to be wrong.
+    Applies to the clean environment as well as the randomized one, so evaluation and training
+    share the same geometry.
+
+    Note that raising the arms changes their reach to the cloth on the table. The source
+    demonstrations were teleoperated at offset 0.0, so a large correction may make the recorded
+    trajectories unreachable; watch the generation success rate after changing it.
+    """
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
 
         # Set robot
+        mount_z = 0.755 + self.mount_height_offset
         self.scene.robot_1 = YAM_CONFIG_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot_1")
-        self.scene.robot_1.init_state.pos = (0.2525, 0.28, 0.755)
+        self.scene.robot_1.init_state.pos = (0.2525, 0.28, mount_z)
         self.scene.robot_1.init_state.rot = (1.0, 0.0, 0.0, 0.0)
         self.scene.robot_2 = YAM_CONFIG_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot_2")
-        self.scene.robot_2.init_state.pos = (0.2525, -0.33, 0.755)
+        self.scene.robot_2.init_state.pos = (0.2525, -0.33, mount_z)
         self.scene.robot_2.init_state.rot = (1.0, 0.0, 0.0, 0.0)
 
         # Set actions for the specific robot type

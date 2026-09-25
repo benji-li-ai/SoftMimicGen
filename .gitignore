@@ -65,7 +65,8 @@ _build
 datasets
 
 # Tests
-tests/
+tests/*
+!tests/test_nodal_registration.py
 
 # Docker history
 .isaac-lab-docker-history

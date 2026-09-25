@@ -139,6 +139,7 @@ def transform_source_data_segment_using_nodal_registration(
     use_rotation_transform: bool = True,
     bend_coef: float = 0.1,
     rot_coef: float = 1e-3,
+    eef_warp_offset: tuple[float, float, float] | None = None,
 ) -> torch.Tensor:
     """
     Transform a source data segment using non-rigid registration between source and target object nodal positions.
@@ -151,78 +152,139 @@ def transform_source_data_segment_using_nodal_registration(
         use_rotation_transform: whether to transform rotations using Jacobian (default: True)
         bend_coef: bending coefficient for TPS regularization (default: 0.1)
         rot_coef: rotation regularization coefficient for TPS (default: 1e-3)
+        eef_warp_offset: fixed grasp-point offset in the recorded EEF's local axes, in metres.
+            Warp this point and its local Jacobian, then return poses of the original control frame.
+            None keeps the warp centered at the recorded EEF origin.
 
     Returns:
         transformed_eef_poses: transformed pose sequence (shape [T, 4, 4])
     """
-
     # Convert tensors to numpy for Rapprentice functions
-    src_nodal_np = src_obj_nodal_pos.detach().cpu().numpy()
-    tgt_nodal_np = tgt_obj_nodal_pos.detach().cpu().numpy()
+    src_nodal_np = src_obj_nodal_pos.detach().cpu().numpy().astype(np.float64)
+    tgt_nodal_np = tgt_obj_nodal_pos.detach().cpu().numpy().astype(np.float64)
 
     # Ensure we have the same number of nodal points
     assert src_nodal_np.shape[0] == tgt_nodal_np.shape[0], "Source and target must have same number of nodal points"
     assert src_nodal_np.shape[1] == 3, "Nodal positions must be 3D"
 
-    # Fit TPS transformation from source to target nodal positions
+    # Similarity-anchored registration. Two earlier findings drive this design:
+    # (1) A free-affine TPS between differently-crumpled mid-fold cloths produced a
+    #     collapsing linear part (det ~0.5, Z-shear -0.44 on the YAM cell), shrinking
+    #     the workspace and flattening the release sweep.
+    # (2) A pure rigid anchor (rotation + translation) protects against (1) but cannot
+    #     absorb uniform cloth scaling: a 0.7x cloth left residual dets of 0.04-0.49,
+    #     tripping the guardrail on every cloth subtask and reverting to unadapted
+    #     trajectories that grasped empty air.
+    # The anchor is therefore a 2D-xy similarity transform: rotation + uniform xy
+    # scale + translation fitted by Umeyama on the two clouds, with z treated
+    # rigidly. Rationale: the cloth is a planar object on a fixed-height table, so
+    # legitimate scale changes are in-plane; scaling z would also scale EE heights
+    # (dive depth, sweep clearance) relative to the table, which is unphysical.
+    # Rotation is fitted in 3D so cloth tilt still maps correctly. The TPS residual
+    # then absorbs only local shape difference (crumple), with the same guardrail.
+    src_mean = src_nodal_np.mean(axis=0)
+    tgt_mean = tgt_nodal_np.mean(axis=0)
+    src_centered = src_nodal_np - src_mean
+    tgt_centered = tgt_nodal_np - tgt_mean
+    cov = src_centered.T @ tgt_centered / len(src_centered)
+    u, _, vt = np.linalg.svd(cov)
+    # Kabsch reflection guard: correct the last singular direction (a column flip,
+    # not a row flip) so rotation is always proper, det = +1. The source cloud at
+    # the grasp boundary is nearly flat (z-extent ~0), so its third singular vector
+    # is sign-ambiguous and this branch is hit routinely.
+    d = np.sign(np.linalg.det(u @ vt))
+    rotation = u @ np.diag([1.0, 1.0, d]) @ vt
+    # Umeyama uniform scale in the SOURCE (object) frame. USD cloth scale acts on the
+    # object's local axes BEFORE rotation, so the anchor is A = diag(s,s,1) @ R
+    # (scale the source plane, then rotate). Row-convention proof: tgt-sc =
+    # sc @ diag(s,s,1) @ Rk, so rotating the target back into the source frame
+    # (tc @ Rk.T) recovers sc @ diag(s,s,1) exactly, and the scale is the
+    # cross-term ratio in that frame. Kabsch Rk (with the reflection guard) equals
+    # the true rotation in row convention; verified to 1e-7 on yaw/pitch/combined
+    # synthetic cases. Guarded against degenerate source spread.
+    y_src_frame = tgt_centered @ rotation.T
+    s_est = float((y_src_frame[:, :2] * src_centered[:, :2]).sum() / (src_centered[:, :2] ** 2).sum())
+    scale = float(np.clip(s_est, 0.25, 4.0))
+    anchor_lin = np.diag([scale, scale, 1.0]) @ rotation
+    anchor_trans = tgt_mean - src_mean @ anchor_lin
+    aligned_src = src_centered @ anchor_lin + tgt_mean
+
     lin_ag, trans_g, w_ng = tps_fit2(
-        x_na=src_nodal_np,
+        x_na=aligned_src,
         y_ng=tgt_nodal_np,
         bend_coef=bend_coef,
-        rot_coef=rot_coef
+        rot_coef=rot_coef,
     )
+
+    # Guardrail: the residual affine part must stay near-identity. If a degenerate
+    # fit still slips through, fall back to the similarity anchor alone.
+    residual_det = float(np.linalg.det(lin_ag))
+    if not 0.7 < residual_det < 1.4:
+        print(
+            f"[nodal_registration] WARNING: residual TPS affine det={residual_det:.3f} outside [0.7, 1.4];"
+            " falling back to similarity-only warp for this subtask.",
+            flush=True,
+        )
+        lin_ag = np.eye(3)
+        trans_g = np.zeros(3)
+        w_ng = np.zeros_like(w_ng)
+
+    def apply_warp(points_np):
+        aligned = points_np @ anchor_lin + anchor_trans
+        return tps_eval(
+            x_ma=aligned,
+            lin_ag=lin_ag,
+            trans_g=trans_g,
+            w_ng=w_ng,
+            x_na=aligned_src,
+        )
 
     # Extract positions and rotations from source eef poses
     src_eef_pos, src_eef_rot = PoseUtils.unmake_pose(src_eef_poses)
     src_eef_pos_np = src_eef_pos.detach().cpu().numpy()
+    src_eef_rot_np = src_eef_rot.detach().cpu().numpy()
+    if eef_warp_offset is not None:
+        # The cloth scales/deforms; the physical tool does not. Transfer the grasp
+        # point rather than the wrist, including the Jacobian evaluation below.
+        offset_np = np.asarray(eef_warp_offset, dtype=src_eef_pos_np.dtype)
+        src_eef_pos_np = src_eef_pos_np + src_eef_rot_np @ offset_np
 
-    # Apply TPS transformation to the positions
-    transformed_pos_np = tps_eval(
-        x_ma=src_eef_pos_np,
-        lin_ag=lin_ag,
-        trans_g=trans_g,
-        w_ng=w_ng,
-        x_na=src_nodal_np
-    )
-
+    # Apply the similarity-anchored TPS warp to the positions
+    transformed_pos_np = apply_warp(src_eef_pos_np)
     # Handle rotation transformation based on the flag
     if use_rotation_transform:
-        # Transform rotations using TPS gradients
-        # The gradient gives us the Jacobian matrix at each point
-        # We can use this to transform the rotation matrices
+        # The warped map is p -> tps(p @ anchor_lin + anchor_trans), so the full
+        # column-convention Jacobian is J_tps @ anchor_lin.T (chain rule on the
+        # row-vector affine). tps_grad returns exactly the column convention:
+        # for a pure affine y = x @ A it returns A.T (verified against tps_fit2).
         grad_mga = tps_grad(
-            x_ma=src_eef_pos_np,
+            x_ma=src_eef_pos_np @ anchor_lin + anchor_trans,
             lin_ag=lin_ag,
             _trans_g=trans_g,
             w_ng=w_ng,
-            x_na=src_nodal_np
+            x_na=aligned_src
         )
-
-        # Convert source rotations to numpy for processing
-        src_eef_rot_np = src_eef_rot.detach().cpu().numpy()
 
         # Transform each rotation matrix using the local Jacobian
         transformed_rot_np = np.zeros_like(src_eef_rot_np)
         for i in range(len(src_eef_pos_np)):
-            # Get the Jacobian at this point (3x3 matrix)
-            J = grad_mga[i]  # Shape: (3, 3)
-
-            # Apply the Jacobian to the rotation matrix
-            # R_transformed = J * R_original
-            transformed_rot_np[i] = J @ src_eef_rot_np[i]
+            # R_transformed = (J_tps @ anchor_lin.T) @ R_original
+            transformed_rot_np[i] = grad_mga[i] @ anchor_lin.T @ src_eef_rot_np[i]
 
             # Orthogonalize the result to ensure it's still a valid rotation matrix
             # Use SVD to get the closest rotation matrix
             U, _, Vt = np.linalg.svd(transformed_rot_np[i])
             transformed_rot_np[i] = U @ Vt
-
             # Ensure proper orientation (determinant = 1)
             if np.linalg.det(transformed_rot_np[i]) < 0:
                 Vt[-1, :] *= -1
                 transformed_rot_np[i] = U @ Vt
     else:
         # Keep original rotations without transformation
-        transformed_rot_np = src_eef_rot.detach().cpu().numpy()
+        transformed_rot_np = src_eef_rot_np
+
+    if eef_warp_offset is not None:
+        transformed_pos_np -= transformed_rot_np @ offset_np
 
     # Convert back to torch tensors
     transformed_pos = torch.from_numpy(transformed_pos_np).to(
@@ -254,6 +316,7 @@ def transform_source_data_segment_using_nodal_registration_scaled_tps_rpm_bij(
     rad_init: float = 0.1,
     rad_final: float = 0.005,
     rot_reg: float = 1e-3,
+    eef_warp_offset: tuple[float, float, float] | None = None,
 ) -> torch.Tensor:
     """
     Transform a source data segment using TPS-RPM-BIJ registration with scaled point clouds.
@@ -270,6 +333,8 @@ def transform_source_data_segment_using_nodal_registration_scaled_tps_rpm_bij(
         rad_init: initial radius for correspondence (default: 0.1)
         rad_final: final radius for correspondence (default: 0.005)
         rot_reg: rotation regularization coefficient (default: 1e-3)
+        eef_warp_offset: fixed grasp-point offset in local EEF axes, in metres. Returned poses
+            remain in the original control frame; None keeps registration centered at its origin.
 
     Returns:
         transformed_eef_poses: transformed pose sequence (shape [T, 4, 4])
@@ -305,6 +370,10 @@ def transform_source_data_segment_using_nodal_registration_scaled_tps_rpm_bij(
     # Extract positions and rotations from source eef poses
     src_eef_pos, src_eef_rot = PoseUtils.unmake_pose(src_eef_poses)
     src_eef_pos_np = src_eef_pos.detach().cpu().numpy()
+    src_eef_rot_np = src_eef_rot.detach().cpu().numpy()
+    if eef_warp_offset is not None:
+        offset_np = np.asarray(eef_warp_offset, dtype=src_eef_pos_np.dtype)
+        src_eef_pos_np = src_eef_pos_np + src_eef_rot_np @ offset_np
 
     # Apply the unscaled transformation to the end effector positions
     transformed_pos_np = f_unscaled.transform_points(src_eef_pos_np)
@@ -312,8 +381,7 @@ def transform_source_data_segment_using_nodal_registration_scaled_tps_rpm_bij(
     # Handle rotation transformation based on the flag
     if use_rotation_transform:
         # Transform rotations using the transformation's Jacobian
-        transformed_rot_np = np.zeros_like(src_eef_rot.detach().cpu().numpy())
-        src_eef_rot_np = src_eef_rot.detach().cpu().numpy()
+        transformed_rot_np = np.zeros_like(src_eef_rot_np)
 
         for i in range(len(src_eef_pos_np)):
             # Get the Jacobian at this point
@@ -333,7 +401,10 @@ def transform_source_data_segment_using_nodal_registration_scaled_tps_rpm_bij(
                 transformed_rot_np[i] = U @ Vt
     else:
         # Keep original rotations without transformation
-        transformed_rot_np = src_eef_rot.detach().cpu().numpy()
+        transformed_rot_np = src_eef_rot_np
+
+    if eef_warp_offset is not None:
+        transformed_pos_np -= transformed_rot_np @ offset_np
 
     # Convert back to torch tensors
     transformed_pos = torch.from_numpy(transformed_pos_np).to(
@@ -761,6 +832,7 @@ class DataGenerator:
 
         if subtask_object_soft:
             if subtask_object_name is not None:
+                eef_warp_offset = getattr(self.env_cfg, "eef_warp_offsets", {}).get(eef_name)
                 # Choose between different nodal registration methods
                 # Option 1: Use scaled TPS-RPM-BIJ
                 # Option 2 - default: Use standard TPS method (requires same point counts)
@@ -772,6 +844,7 @@ class DataGenerator:
                         src_eef_poses=src_eef_poses,
                         src_obj_nodal_pos=src_subtask_nodal_positions,
                         use_rotation_transform=True,
+                        eef_warp_offset=eef_warp_offset,
                         n_iter=50,
                         reg_init=10.0,
                         reg_final=0.1,
@@ -786,6 +859,7 @@ class DataGenerator:
                         src_eef_poses=src_eef_poses,
                         src_obj_nodal_pos=src_subtask_nodal_positions,
                         use_rotation_transform=True,
+                        eef_warp_offset=eef_warp_offset,
                         bend_coef=0.1,
                         rot_coef=1e-3
                     )

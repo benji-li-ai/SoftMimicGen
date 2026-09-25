@@ -173,6 +173,19 @@ class YamTowelMimicEnv(ManagerBasedRLMimicEnv):
         target_robot1_pos_w, target_robot1_rot_w = PoseUtils.unmake_pose(target_eef_pose_dict["robot1"])
         target_robot1_quat_w = PoseUtils.quat_from_matrix(target_robot1_rot_w)
 
+        # The target poses arrive in the ENVIRONMENT frame, not the world frame: they are produced
+        # by warping source poses that came from `get_robot_eef_pose` -> the `robot*_eef_pos`
+        # observations, and `mdp.ee_frame_pos` subtracts `env_origins` from the world position.
+        # The root poses below are true world poses, so the environment origin has to be added
+        # back before converting into the robot base frame.
+        #
+        # Omitting this is a no-op for env 0, whose origin is zero, which is why single-environment
+        # generation always worked. For env 1 with the default 2.5 m spacing it commands the IK to
+        # a pose 2.5 m from the intended one; the arm saturates and the simulation diverges.
+        env_origin = self.scene.env_origins[env_id]
+        target_robot0_pos_w = target_robot0_pos_w + env_origin
+        target_robot1_pos_w = target_robot1_pos_w + env_origin
+
         # Convert target poses to base frame
         target_robot0_pos_b, target_robot0_quat_b = subtract_frame_transforms(
             robot0_root_pos_w.unsqueeze(0), robot0_root_quat_w.unsqueeze(0),

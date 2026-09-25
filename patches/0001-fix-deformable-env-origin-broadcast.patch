@@ -1,0 +1,40 @@
+diff --git a/source/isaaclab/isaaclab/scene/interactive_scene.py b/source/isaaclab/isaaclab/scene/interactive_scene.py
+index 0ad5b9b08..7b849b88e 100644
+--- a/source/isaaclab/isaaclab/scene/interactive_scene.py
++++ b/source/isaaclab/isaaclab/scene/interactive_scene.py
+@@ -554,7 +554,7 @@ class InteractiveScene:
+             asset_state = state["deformable"][asset_name]
+             nodal_position = asset_state["nodal_position"].clone()
+             if is_relative:
+-                nodal_position[:, :3] += self.env_origins[env_ids]
++                nodal_position += self.env_origins[env_ids].unsqueeze(1)
+             nodal_velocity = asset_state["nodal_velocity"].clone()
+             # nodal_kinematic_target = asset_state["nodal_kinematic_target"].clone()
+             deformable.write_nodal_pos_to_sim(nodal_position, env_ids=env_ids)
+@@ -565,7 +565,7 @@ class InteractiveScene:
+             asset_state = state["deformable_object"][asset_name]
+             nodal_position = asset_state["nodal_position"].clone()
+             if is_relative:
+-                nodal_position[:, :3] += self.env_origins[env_ids]
++                nodal_position += self.env_origins[env_ids].unsqueeze(1)
+             nodal_velocity = asset_state["nodal_velocity"].clone()
+             nodal_kinematic_target = asset_state["nodal_kinematic_target"].clone()
+             deformable_object.write_nodal_pos_to_sim(nodal_position, env_ids=env_ids)
+@@ -658,7 +658,7 @@ class InteractiveScene:
+             asset_state = dict()
+             asset_state["nodal_position"] = deformable.data.nodal_pos_w.clone()
+             if is_relative:
+-                asset_state["nodal_position"][:, :3] -= self.env_origins
++                asset_state["nodal_position"] -= self.env_origins.unsqueeze(1)
+             asset_state["nodal_velocity"] = deformable.data.nodal_vel_w.clone()
+             # asset_state["nodal_kinematic_target"] = deformable.data.nodal_kinematic_target.clone()
+             state["deformable"][asset_name] = asset_state
+@@ -668,7 +668,7 @@ class InteractiveScene:
+             asset_state = dict()
+             asset_state["nodal_position"] = deformable_object.data.nodal_pos_w.clone()
+             if is_relative:
+-                asset_state["nodal_position"][:, :3] -= self.env_origins
++                asset_state["nodal_position"] -= self.env_origins.unsqueeze(1)
+             asset_state["nodal_velocity"] = deformable_object.data.nodal_vel_w.clone()
+             asset_state["nodal_kinematic_target"] = deformable_object.data.nodal_kinematic_target.clone()
+             state["deformable_object"][asset_name] = asset_state

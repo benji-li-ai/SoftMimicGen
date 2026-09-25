@@ -3,24 +3,120 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import asyncio
-import contextlib
+import inspect
+import math
+import time
 import torch
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Sequence
 
-from isaaclab.envs import ManagerBasedRLMimicEnv
-from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
-from isaaclab.managers import DatasetExportMode, TerminationTermCfg
+if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedRLMimicEnv
+    from isaaclab.managers import TerminationTermCfg
 
-from softmimicgen.datagen.data_generator import DataGenerator
-from softmimicgen.datagen.datagen_info_pool import DataGenInfoPool
+    from softmimicgen.datagen.data_generator import DataGenerator
 
-from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
-# global variable to keep track of the data generation statistics
-num_success = 0
-num_failures = 0
-num_attempts = 0
+@dataclass(frozen=True)
+class GenerationLimits:
+    """Optional run-wide bounds, independent of the task's success/attempt target.
+
+    ``max_attempts`` caps attempts started across all environments. ``max_steps``
+    counts vector ``env.step`` calls, not physics substeps or per-environment steps.
+    ``timeout_seconds`` measures wall time in ``env_loop``, including queue waits,
+    but excluding simulator startup and source loading. It is checked between
+    synchronous simulator/generator operations, which cannot be preempted.
+    """
+
+    max_attempts: int | None = None
+    max_steps: int | None = None
+    timeout_seconds: float | None = None
+
+    def __post_init__(self):
+        for name in ("max_attempts", "max_steps"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{name} must be a positive integer")
+        if self.timeout_seconds is not None and (not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0):
+            raise ValueError("timeout_seconds must be finite and positive")
+
+
+@dataclass
+class GenerationState:
+    """Run-local counters shared by the native workers and simulation loop."""
+
+    generation_num_trials: int
+    generation_guarantee: bool
+    limits: GenerationLimits = field(default_factory=GenerationLimits)
+    num_success: int = 0
+    num_failures: int = 0
+    num_attempts: int = 0
+    num_started: int = 0
+    num_steps: int = 0
+    stop_reason: str | None = None
+    started_at: float | None = None
+    elapsed_seconds: float = 0.0
+    active_env_ids: set[int] = field(default_factory=set)
+    stopped: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def check_stop(self) -> str | None:
+        """Latch the first normal or bounded stop condition."""
+        if self.stop_reason is None:
+            target_count = self.num_success if self.generation_guarantee else self.num_attempts
+            if target_count >= self.generation_num_trials:
+                self.stop_reason = "generation_num_trials"
+            elif self.limits.max_attempts is not None and self.num_attempts >= self.limits.max_attempts:
+                self.stop_reason = "max_attempts"
+            elif self.limits.max_steps is not None and self.num_steps >= self.limits.max_steps:
+                self.stop_reason = "max_steps"
+            elif (
+                self.limits.timeout_seconds is not None
+                and self.started_at is not None
+                and time.monotonic() - self.started_at >= self.limits.timeout_seconds
+            ):
+                self.stop_reason = "timeout_seconds"
+        if self.stop_reason is not None:
+            self.stopped.set()
+        return self.stop_reason
+
+    def can_start_attempt(self) -> bool:
+        """Reserve no more than the attempt target/cap, even with multiple workers."""
+        if self.limits.max_attempts is not None and self.num_started >= self.limits.max_attempts:
+            return False
+        return self.generation_guarantee or self.num_started < self.generation_num_trials
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "stop_reason": self.stop_reason,
+            "num_success": self.num_success,
+            "num_failures": self.num_failures,
+            "num_attempts": self.num_attempts,
+            "num_started": self.num_started,
+            "num_interrupted": self.num_started - self.num_attempts,
+            "num_steps": self.num_steps,
+            "elapsed_seconds": self.elapsed_seconds,
+        }
+
+
+def success_term_metadata(success_term: TerminationTermCfg) -> dict[str, Any]:
+    """Describe the actual success callable, including its effective defaults."""
+    signature = inspect.signature(success_term.func)
+    bound = signature.bind(None, **success_term.params)
+    bound.apply_defaults()
+    parameters = dict(bound.arguments)
+    parameters.pop(next(iter(signature.parameters)))  # The environment is supplied at evaluation time.
+    for name, parameter in signature.parameters.items():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            parameters.update(parameters.pop(name, {}))
+        elif parameter.kind == inspect.Parameter.VAR_POSITIONAL and not parameters.get(name):
+            parameters.pop(name, None)
+    return {
+        "function": f"{success_term.func.__module__}.{success_term.func.__qualname__}",
+        "parameters": parameters,
+    }
 
 
 async def run_data_generator(
@@ -30,105 +126,122 @@ async def run_data_generator(
     env_action_queue: asyncio.Queue,
     data_generator: DataGenerator,
     success_term: TerminationTermCfg,
+    state: GenerationState,
     pause_subtask: bool = False,
 ):
-    """Run mimic data generation from the given data generator in the specified environment index.
-
-    Args:
-        env: The environment to run the data generator on.
-        env_id: The environment index to run the data generation on.
-        env_reset_queue: The asyncio queue to send environment (for this particular env_id) reset requests to.
-        env_action_queue: The asyncio queue to send actions to for executing actions.
-        data_generator: The data generator instance to use.
-        success_term: The success termination term to use.
-        pause_subtask: Whether to pause the subtask during generation.
-    """
-    global num_success, num_failures, num_attempts
-    while True:
-        results = await data_generator.generate(
-            env_id=env_id,
-            success_term=success_term,
-            env_reset_queue=env_reset_queue,
-            env_action_queue=env_action_queue,
-            pause_subtask=pause_subtask,
-        )
+    """Run native generation, checking completion before starting another attempt."""
+    while state.check_stop() is None:
+        if not state.can_start_attempt():
+            # Other workers own the remaining attempts. Do not complete normally
+            # until the shared target is reached, or enqueue an extra reset/action.
+            await state.stopped.wait()
+            return
+        state.num_started += 1
+        state.active_env_ids.add(env_id)
+        try:
+            results = await data_generator.generate(
+                env_id=env_id,
+                success_term=success_term,
+                env_reset_queue=env_reset_queue,
+                env_action_queue=env_action_queue,
+                pause_subtask=pause_subtask,
+            )
+        finally:
+            state.active_env_ids.remove(env_id)
         if bool(results["success"]):
-            num_success += 1
+            state.num_success += 1
         else:
-            num_failures += 1
-        num_attempts += 1
+            state.num_failures += 1
+        state.num_attempts += 1
 
 
 def env_loop(
     env: ManagerBasedRLMimicEnv,
     env_reset_queue: asyncio.Queue,
     env_action_queue: asyncio.Queue,
-    shared_datagen_info_pool: DataGenInfoPool,
     asyncio_event_loop: asyncio.AbstractEventLoop,
-):
-    """Main asyncio loop for the environment.
+    generation_tasks: Sequence[asyncio.Task],
+    state: GenerationState,
+) -> dict[str, Any]:
+    """Drive one native vector environment and own cancellation of its workers.
 
-    Args:
-        env: The environment to run the main step loop on.
-        env_reset_queue: The asyncio queue to handle reset request the environment.
-        env_action_queue: The asyncio queue to handle actions to for executing actions.
-        shared_datagen_info_pool: The shared datagen info pool that stores source demo info.
-        asyncio_event_loop: The main asyncio event loop.
+    Bounds and task results are checked on every queue-wait iteration, before
+    resetting or stepping. A final step is acknowledged to the workers before
+    stopping, so a completed episode is exported by ``DataGenerator`` without
+    starting another attempt. Interrupted attempts are not completed demos and
+    are not exported. The caller owns closing the environment and Kit; the
+    existing asyncio loop is borrowed, never replaced or closed here.
     """
-    global num_success, num_failures, num_attempts
-    env_id_tensor = torch.tensor([0], dtype=torch.int64, device=env.device)
     prev_num_attempts = 0
-    # simulate environment -- run everything in inference mode
-    with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
-        while True:
-
-            # check if any environment needs to be reset while waiting for actions
-            while env_action_queue.qsize() != env.num_envs:
+    state.started_at = time.monotonic()
+    try:
+        env_id_tensor = torch.tensor([0], dtype=torch.int64, device=env.device)
+        actions = torch.zeros(env.action_space.shape, device=env.device)
+        with torch.inference_mode():
+            while True:
+                # Let generators consume the last step and publish their result
+                # before examining limits, resets, or the next action batch.
                 asyncio_event_loop.run_until_complete(asyncio.sleep(0))
-                while not env_reset_queue.empty():
+                stop_reason = state.check_stop()
+                for task in generation_tasks:
+                    if task.done():
+                        task.result()  # Exceptions always win over a simultaneous stop.
+                        if stop_reason is None:
+                            raise RuntimeError(f"Data generation task {task.get_name()!r} completed unexpectedly.")
+
+                if prev_num_attempts != state.num_attempts:
+                    prev_num_attempts = state.num_attempts
+                    success_rate = 100 * state.num_success / state.num_attempts
+                    print(
+                        f"{state.num_success}/{state.num_attempts} ({success_rate:.1f}%) successful demos generated"
+                        " by mimic",
+                        flush=True,
+                    )
+                if stop_reason is not None:
+                    print(f"Generation stopped: {stop_reason}", flush=True)
+                    break
+                if env.sim.is_stopped():
+                    state.stop_reason = "simulation_stopped"
+                    break
+
+                while not env_reset_queue.empty() and state.check_stop() is None:
                     env_id_tensor[0] = env_reset_queue.get_nowait()
                     env.reset(env_ids=env_id_tensor)
                     env_reset_queue.task_done()
 
-            actions = torch.zeros(env.action_space.shape)
+                if state.check_stop() is not None:
+                    continue
+                if not state.active_env_ids or env_action_queue.qsize() != len(state.active_env_ids):
+                    continue
 
-            # get actions from all the data generators
-            for i in range(env.num_envs):
-                # an async-blocking call to get an action from a data generator
-                env_id, action = asyncio_event_loop.run_until_complete(env_action_queue.get())
-                actions[env_id] = action
-
-            # perform action on environment
-            env.step(actions)
-
-            # mark done so the data generators can continue with the step results
-            for i in range(env.num_envs):
-                env_action_queue.task_done()
-
-            if prev_num_attempts != num_attempts:
-                prev_num_attempts = num_attempts
-                generated_sucess_rate = 100 * num_success / num_attempts if num_attempts > 0 else 0.0
-                print("")
-                print("*" * 50, "\033[K")
-                print(
-                    f"{num_success}/{num_attempts} ({generated_sucess_rate:.1f}%) successful demos generated by"
-                    " mimic\033[K"
-                )
-                print("*" * 50, "\033[K")
-
-                # termination condition is on enough successes if @guarantee_success or enough attempts otherwise
-                generation_guarantee = env.cfg.datagen_config.generation_guarantee
-                generation_num_trials = env.cfg.datagen_config.generation_num_trials
-                check_val = num_success if generation_guarantee else num_attempts
-                if check_val >= generation_num_trials:
-                    print(f"Reached {generation_num_trials} successes/attempts. Exiting.")
-                    break
-
-            # check that simulation is stopped or not
-            if env.sim.is_stopped():
-                break
-
-    env.close()
+                # Workers with no remaining attempt reservation are idle. They do
+                # not participate in the action barrier of the vector environment.
+                if len(state.active_env_ids) != env.num_envs:
+                    actions.zero_()
+                num_actions = env_action_queue.qsize()
+                for _ in range(num_actions):
+                    env_id, action = env_action_queue.get_nowait()
+                    actions[env_id] = action
+                if state.check_stop() is not None:
+                    continue
+                env.step(actions)
+                state.num_steps += 1
+                for _ in range(num_actions):
+                    env_action_queue.task_done()
+    except KeyboardInterrupt:
+        state.stop_reason = "keyboard_interrupt"
+        raise
+    except BaseException:
+        state.stop_reason = "error"
+        raise
+    finally:
+        for task in generation_tasks:
+            if not task.done():
+                task.cancel()
+        if generation_tasks:
+            asyncio_event_loop.run_until_complete(asyncio.gather(*generation_tasks, return_exceptions=True))
+        state.elapsed_seconds = time.monotonic() - state.started_at
+    return state.summary()
 
 
 def setup_env_config(
@@ -138,72 +251,54 @@ def setup_env_config(
     num_envs: int,
     device: str,
     generation_num_trials: int | None = None,
+    keep_failed: bool = False,
 ) -> tuple[Any, Any]:
-    """Configure the environment for data generation.
+    """Configure the registered task and its native action/state recorders.
 
-    Args:
-        env_name: Name of the environment
-        output_dir: Directory to save output
-        output_file_name: Name of output file
-        num_envs: Number of environments to run
-        device: Device to run on
-        generation_num_trials: Optional override for number of trials
-
-    Returns:
-        tuple containing:
-            - env_cfg: The environment configuration
-            - success_term: The success termination condition
-
-    Raises:
-        NotImplementedError: If no success termination term found
+    ``generation_num_trials`` preserves the task's success/attempt semantics.
+    ``keep_failed`` enables failed exports without disabling a task's own setting.
     """
-    env_cfg = parse_env_cfg(env_name, device=device, num_envs=num_envs)
+    from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
+    from isaaclab.managers import DatasetExportMode
 
+    from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+    env_cfg = parse_env_cfg(env_name, device=device, num_envs=num_envs)
     if generation_num_trials is not None:
         env_cfg.datagen_config.generation_num_trials = generation_num_trials
-
+    if keep_failed:
+        env_cfg.datagen_config.generation_keep_failed = True
     env_cfg.env_name = env_name
 
-    # Extract success checking function
-    success_term = None
-    if hasattr(env_cfg.terminations, "success"):
-        success_term = env_cfg.terminations.success
-        env_cfg.terminations.success = None
-    else:
+    # Extract the registered success predicate before disabling terminations.
+    success_term = getattr(env_cfg.terminations, "success", None)
+    if success_term is None:
         raise NotImplementedError("No success termination term was found in the environment.")
-
-    # Configure for data generation
     env_cfg.terminations = None
     env_cfg.observations.policy.concatenate_terms = False
 
-    # Setup recorders
     env_cfg.recorders = ActionStateRecorderManagerCfg()
     env_cfg.recorders.dataset_export_dir_path = output_dir
     env_cfg.recorders.dataset_filename = output_file_name
-
     if env_cfg.datagen_config.generation_keep_failed:
         env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_FAILED_IN_SEPARATE_FILES
     else:
         env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
-
     return env_cfg, success_term
 
 
 def setup_async_generation(
-    env: Any, num_envs: int, input_file: str, success_term: Any, pause_subtask: bool = False
+    env: Any,
+    num_envs: int,
+    input_file: str,
+    success_term: Any,
+    pause_subtask: bool = False,
+    limits: GenerationLimits | None = None,
 ) -> dict[str, Any]:
-    """Setup async data generation tasks.
+    """Load the native source pool and schedule workers on the existing event loop."""
+    from softmimicgen.datagen.data_generator import DataGenerator
+    from softmimicgen.datagen.datagen_info_pool import DataGenInfoPool
 
-    Args:
-        env: The environment instance
-        num_envs: Number of environments to run
-        input_file: Path to input dataset file
-        success_term: Success termination condition
-        pause_subtask: Whether to pause after subtasks
-
-    Returns:
-        List of asyncio tasks for data generation
-    """
     asyncio_event_loop = asyncio.get_event_loop()
     env_reset_queue = asyncio.Queue()
     env_action_queue = asyncio.Queue()
@@ -212,21 +307,33 @@ def setup_async_generation(
     shared_datagen_info_pool.load_from_dataset_file(input_file)
     print(f"Loaded {shared_datagen_info_pool.num_datagen_infos} to datagen info pool")
 
-    # Create and schedule data generator tasks
+    state = GenerationState(
+        generation_num_trials=env.cfg.datagen_config.generation_num_trials,
+        generation_guarantee=env.cfg.datagen_config.generation_guarantee,
+        limits=limits if limits is not None else GenerationLimits(),
+    )
     data_generator = DataGenerator(env=env, src_demo_datagen_info_pool=shared_datagen_info_pool)
-    data_generator_asyncio_tasks = []
-    for i in range(num_envs):
-        task = asyncio_event_loop.create_task(
+    tasks = [
+        asyncio_event_loop.create_task(
             run_data_generator(
-                env, i, env_reset_queue, env_action_queue, data_generator, success_term, pause_subtask=pause_subtask
-            )
+                env,
+                i,
+                env_reset_queue,
+                env_action_queue,
+                data_generator,
+                success_term,
+                state,
+                pause_subtask=pause_subtask,
+            ),
+            name=f"data_generator_{i}",
         )
-        data_generator_asyncio_tasks.append(task)
-
+        for i in range(num_envs)
+    ]
     return {
-        "tasks": data_generator_asyncio_tasks,
+        "tasks": tasks,
         "event_loop": asyncio_event_loop,
         "reset_queue": env_reset_queue,
         "action_queue": env_action_queue,
         "info_pool": shared_datagen_info_pool,
+        "state": state,
     }

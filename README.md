@@ -40,6 +40,9 @@ The SoftMimicGen pipeline consists of three steps: **record** (teleoperate), **a
 
 > **Note:** Humanoid tasks require the `--enable_pinocchio` flag for all commands below.
 
+For the package-backed YAM cell task, bounded iteration commands, and the fresh-recording
+contract, see [Native YAM cell recording and generation](EXTRAPOLATION_PLAN.md).
+
 ### Generate from Pre-Annotated Datasets
 
 Annotated datasets are downloaded automatically during installation to `datasets/annotated_dataset/`. New demonstrations can be generated as follows:
@@ -81,6 +84,7 @@ python scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
 | Tissue Lift | `Isaac-Tissue-PSM-IK-Rel-v0` | `Isaac-Tissue-PSM-IK-Rel-Mimic-v0` | Surgical PSM |
 | Threading | `Isaac-Thread-PSM-IK-Rel-v0` | `Isaac-Thread-PSM-IK-Rel-Mimic-v0` | Surgical PSM |
 | Towel Fold | `Isaac-Fold-Towel-Yam-Joint-v0` | `Isaac-Fold-Towel-Yam-Joint-Mimic-v0` | YAM |
+| Cell Towel Fold | `Isaac-Fold-Cell-Towel-Yam-Joint-v0` | `Isaac-Fold-Cell-Towel-Yam-Joint-Mimic-v0` | YAM |
 | Bag Loading | `Isaac-Bag-Yam-Joint-v0` | `Isaac-Bag-Yam-Joint-Mimic-v0` | YAM |
 
 ## Contribution Guidelines
